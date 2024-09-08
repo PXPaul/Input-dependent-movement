@@ -267,7 +267,7 @@ class DistilBertAttention(nn.Module):
         outputs = (attention_output,) + self_outputs[1:]
         return outputs
 
-# we can add head_mask here
+
 class DistilBertSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -381,10 +381,9 @@ class MaskedLinear(nn.Linear):
         self.mask_scale = mask_scale
         self.mask_init = mask_init
 
-        ### randn
+        ### mask_score
         self.mask_scores_1 = nn.Parameter(torch.randn(self.weight.size()))
         self.mask_scores_2 = nn.Parameter(torch.randn(self.weight.size()))
-    
         
         self.num_masks = 2
 
@@ -394,7 +393,6 @@ class MaskedLinear(nn.Linear):
         mask1 = TopKBinarizer.apply(self.mask_scores_1, threshold)
         mask2 = TopKBinarizer.apply(self.mask_scores_2, threshold)
         
-
         gate_scores = self.gate_lin(input)
         selected_mask_index = torch.argmax(gate_scores, dim=-1, keepdim=True).expand(-1, -1, input.size(-1))
 
@@ -431,24 +429,23 @@ class RowMaskedLinear(nn.Linear):
         self.mask_scale = mask_scale
         self.mask_init = mask_init
 
-        ### randn
         self.mask_scores_1 = nn.Parameter(torch.randn(self.weight.size()))
+        self.mask_scores_2 = nn.Parameter(torch.randn(self.weight.size()))
 
-
-        self.num_masks = 1
+        self.num_masks = 2
 
         self.gate_lin = nn.Linear(in_features, self.num_masks)
 
     def forward(self, input: torch.tensor, threshold: float):
         mask1 = RowTopKBinarizer.apply(self.mask_scores_1, threshold)
+        mask2 = RowTopKBinarizer.apply(self.mask_scores_2, threshold)
     
-
         gate_scores = self.gate_lin(input)
         selected_mask_index = torch.argmax(gate_scores, dim=-1, keepdim=True).expand(-1, -1, input.size(-1))
 
         output = torch.zeros((*input.shape[:-1], self.weight.shape[0]), device=input.device)
         
-        for mask_index, mask in enumerate([mask1]):
+        for mask_index, mask in enumerate([mask1, mask2]):
            # This mask selects the inputs that are relevant to this mask
            element_mask = selected_mask_index == mask_index 
            # Select which inputs are relevant to the mask we are using this iteration
@@ -465,7 +462,13 @@ class RowMaskedLinear(nn.Linear):
 class DistilBertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = MaskedLinear(
+            config.hidden_size,
+            config.hidden_size,
+            pruning_method=config.pruning_method,
+            mask_init=config.mask_init,
+            mask_scale=config.mask_scale,
+        )
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 #         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -500,7 +503,13 @@ class DistilBertIntermediate(nn.Module):
 class DistilBertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
+        self.dense = MaskedLinear(
+            config.intermediate_size,
+            config.hidden_size,
+            pruning_method=config.pruning_method,
+            mask_init=config.mask_init,
+            mask_scale=config.mask_scale,
+        )
         self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 #         self.LayerNorm = BertLayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
@@ -511,7 +520,7 @@ class DistilBertOutput(nn.Module):
         hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
-###
+### unstructured
 class TopKBinarizer(autograd.Function):
     """
     Top-k Binarizer.
@@ -537,7 +546,7 @@ class TopKBinarizer(autograd.Function):
     def backward(ctx, gradOutput):
         return gradOutput, None
     
-###
+### strutured
 class RowTopKBinarizer(autograd.Function):
     """
     Row Top-k Binarizer.
