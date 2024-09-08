@@ -281,30 +281,18 @@ class DistilBertSelfAttention(nn.Module):
         self.num_attention_heads = config.num_attention_heads
         self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
         self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-        )
-        self.key = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-        )
-        self.value = MaskedLinear(
-            config.hidden_size,
-            self.all_head_size,
-            pruning_method=config.pruning_method,
-            mask_init=config.mask_init,
-            mask_scale=config.mask_scale,
-        )
+        
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
 
         self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
+        
+        self.headmask_scores_1 = nn.Parameter(torch.randn(self.num_attention_heads))
+        self.headmask_scores_2 = nn.Parameter(torch.randn(self.num_attention_heads))
+        self.num_masks = 2
+
+        self.gate_head = nn.Linear(config.hidden_size, self.num_masks)
 
     def transpose_for_scores(self, x):
         new_x_shape = x.size()[:-1] + (self.num_attention_heads, self.attention_head_size)
@@ -320,48 +308,50 @@ class DistilBertSelfAttention(nn.Module):
         encoder_attention_mask=None,
         threshold=None,
     ):
-        mixed_query_layer = self.query(hidden_states, threshold=threshold)
+        head_mask_1 = TopKBinarizer.apply(self.headmask_scores_1, threshold)
+        head_mask_2 = TopKBinarizer.apply(self.headmask_scores_2, threshold)
 
-        # If this is instantiated as a cross-attention module, the keys
-        # and values come from an encoder; the attention mask needs to be
-        # such that the encoder's padding tokens are not attended to.
-        if encoder_hidden_states is not None:
-            mixed_key_layer = self.key(encoder_hidden_states, threshold=threshold)
-            mixed_value_layer = self.value(encoder_hidden_states, threshold=threshold)
-            attention_mask = encoder_attention_mask
-        else:
-            mixed_key_layer = self.key(hidden_states, threshold=threshold)
-            mixed_value_layer = self.value(hidden_states, threshold=threshold)
+        head_mask1 = head_mask_1.unsqueeze(0).unsqueeze(2).unsqueeze(3).expand(hidden_states.size(0), self.num_attention_heads, hidden_states.size(1), hidden_states.size(1)) 
+        head_mask2 = head_mask_2.unsqueeze(0).unsqueeze(2).unsqueeze(3).expand(hidden_states.size(0), self.num_attention_heads, hidden_states.size(1), hidden_states.size(1)) 
+        
+        gate_scores = self.gate_head(hidden_states)  
+        selected_mask_index = torch.argmax(gate_scores, dim=-1, keepdim=True).expand(-1, -1, hidden_states.size(-1))
+        
+        final_context_layer = torch.zeros(hidden_states.size(), device=hidden_states.device) 
 
-        query_layer = self.transpose_for_scores(mixed_query_layer)
-        key_layer = self.transpose_for_scores(mixed_key_layer)
-        value_layer = self.transpose_for_scores(mixed_value_layer)
+        # Iterate over the mask
+        for mask_index, head_mask in enumerate([head_mask1, head_mask2]):
+            element_mask = selected_mask_index == mask_index 
+            relevant_hidden_states = torch.where(element_mask, hidden_states, 0) 
+            
+            mixed_query_layer = self.query(relevant_hidden_states)
+            mixed_key_layer = self.key(relevant_hidden_states)
+            mixed_value_layer = self.value(relevant_hidden_states)
 
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-            attention_scores = attention_scores + attention_mask
+            query_layer = self.transpose_for_scores(mixed_query_layer)
+            key_layer = self.transpose_for_scores(mixed_key_layer)
+            value_layer = self.transpose_for_scores(mixed_value_layer)
+            
+            attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
+            attention_scores = attention_scores / math.sqrt(self.attention_head_size)
 
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.Softmax(dim=-1)(attention_scores)
+            if attention_mask is not None:
+               attention_scores = attention_scores + attention_mask
 
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
+            attention_probs = nn.Softmax(dim=-1)(attention_scores)
+            attention_probs = self.dropout(attention_probs)
+    
             attention_probs = attention_probs * head_mask
 
-        context_layer = torch.matmul(attention_probs, value_layer)
+            context_layer = torch.matmul(attention_probs, value_layer)
+            context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
+            new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
+            context_layer = context_layer.view(*new_context_layer_shape)
+            
+            final_context_layer += context_layer 
 
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(*new_context_layer_shape)
-
-        outputs = (context_layer, attention_probs) if self.output_attentions else (context_layer,)
+        outputs = (final_context_layer,)
+        
         return outputs
 
 
